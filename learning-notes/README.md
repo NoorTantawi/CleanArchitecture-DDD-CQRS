@@ -13,6 +13,7 @@
 | [flashcards.md](flashcards.md) | Self-quiz Q&A cards, organized by ADR |
 | [mistakes-and-corrections.md](mistakes-and-corrections.md) | Every wrong answer I gave during drills + the correction + why |
 | [bugs-found.md](bugs-found.md) | Real bugs found in this repo while studying — contribution candidates |
+| [questions.md](questions.md) | Every question I ask, reframed, with the full-depth answer — the "extra 10 miles" file |
 | [six-month-plan.md](six-month-plan.md) | Daily/monthly plan from finishing this repo through building a full career portfolio |
 | `ADR-00X-*.md` | Deep-dive notes per architecture decision, with SA-system examples |
 

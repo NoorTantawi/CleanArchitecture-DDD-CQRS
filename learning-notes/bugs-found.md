@@ -71,19 +71,48 @@ Revisit after ADR-005 (Error Management System) is studied, since the fix should
 
 ---
 
-## Bug #2 (candidate, unconfirmed): OutboxDbContext transaction enrollment
+## Bug #2 — CONFIRMED: OutboxDbContext does not share the business transaction
 
-**Status:** Flagged for investigation, not yet confirmed as a bug
-**Found during:** ADR-004 (Outbox Pattern) study
+**Status:** Confirmed by reading `EfUnitOfWork.cs`, `EfTransaction.cs`, `OutboxDbContext.cs`, and `ServiceCollectionExtensions.cs` (outbox project) — 2026-07-18
+**Found during:** ADR-004 (Outbox Pattern) study, follow-up deep dive
+**Severity:** High — undermines ADR-004's core guarantee
 
 ### Where
-[`src/outbox/CleanArchitecture.Outbox/Persistence/EfCoreOutboxStore.cs`](../src/outbox/CleanArchitecture.Outbox/Persistence/EfCoreOutboxStore.cs)
+- [`src/core/CleanArchitecture.Core.Infrastructure.Persistence/EfCore/EfUnitOfWork.cs`](../src/core/CleanArchitecture.Core.Infrastructure.Persistence/EfCore/EfUnitOfWork.cs)
+- [`src/outbox/CleanArchitecture.Outbox/Persistence/EfCoreOutboxStore.cs`](../src/outbox/CleanArchitecture.Outbox/Persistence/EfCoreOutboxStore.cs)
+- [`src/outbox/CleanArchitecture.Outbox/ServiceCollectionExtensions.cs`](../src/outbox/CleanArchitecture.Outbox/ServiceCollectionExtensions.cs)
 
-### The concern
-`EfCoreOutboxStore.AddAsync` calls `SaveChangesAsync()` on a **separate `OutboxDbContext`**, distinct from the main business `DbContext` that `TransactionCommandPipeline` manages. For ADR-004's core guarantee ("outbox write is atomic with business data") to hold true, both contexts need to share the same underlying database connection/transaction — this typically requires explicit transaction enrollment (e.g., sharing a `DbConnection` + `DbTransaction`, or using `TransactionScope`).
+### The evidence
+
+`EfUnitOfWork.BeginTransactionAsync` opens a transaction on the main business `DbContext` only:
+```csharp
+public async Task<ITransaction> BeginTransactionAsync(CancellationToken ct = default)
+    => new EfTransaction(await _db.Database.BeginTransactionAsync(ct));
+```
+
+`OutboxDbContext` is registered as a completely independent context, with its own connection string, no transaction sharing:
+```csharp
+// ServiceCollectionExtensions.AddOutbox
+services.AddDbContext<OutboxDbContext>(dbOptions =>
+    dbOptions.UseSqlServer(connectionString, ...));
+```
+
+There is no call anywhere to `OutboxDbContext.Database.UseTransaction(...)`, no shared `DbConnection`, no `TransactionScope` wrapping both contexts.
 
 ### Why it matters
-If the two contexts are NOT sharing a transaction, there's a window where the business data commits but the outbox write fails (or vice versa) — reintroducing the exact dual-write problem the outbox pattern exists to solve.
+`EfCoreOutboxStore.AddAsync` calls `_context.SaveChangesAsync()` on `OutboxDbContext` **while still inside** `DomainEventsPipeline.Handle` — which runs *before* the main `TransactionCommandPipeline` calls its own `SaveChangesAsync()`/`CommitAsync()`. Because `OutboxDbContext` has no enlisted transaction, that `SaveChangesAsync()` commits **immediately and independently**.
+
+Concrete failure: if the main business transaction later fails (e.g., a `DbUpdateConcurrencyException` on `SaveChangesAsync`) and rolls back, the `OutboxMessage` row **survives anyway** — it already committed in its own separate transaction moments earlier. Result: an outbox row exists claiming an event happened (e.g. `WorkOrderCompletedEvent`), the background processor eventually sends an email/notification for it — but the underlying business change was never actually persisted. This reintroduces the exact dual-write problem the outbox pattern exists to solve.
+
+### Proposed fix
+Share the connection/transaction between the two contexts, e.g.:
+```csharp
+// share the same open DbConnection + DbTransaction across both contexts
+outboxDbContext.Database.SetDbConnection(mainDbContext.Database.GetDbConnection());
+await outboxDbContext.Database.UseTransactionAsync(
+    mainDbContext.Database.CurrentTransaction!.GetDbTransaction());
+```
+Or restructure so the outbox table is a `DbSet` on the *main* business context instead of a separate `OutboxDbContext`, removing the split entirely for the single-database deployment case (the separate-context design exists to support a future separate outbox database — see ADR-004's "Why Separate?" rationale — so this fix needs to preserve that future option, not just delete it).
 
 ### Next step
-Read `TransactionCommandPipeline.cs` and `EfUnitOfWork.cs` together to confirm whether transaction sharing is actually wired up (e.g., via `DbContext.Database.UseTransaction(...)`), or whether this is a real gap. Do this as part of the pipeline deep-dive (tracker.md item #9).
+Checked `TransactionHandling/TransactionCommitTests.cs` — it only covers the background *processor's* per-message transaction (marking `ProcessedAt`), not write-time atomicity between the outbox insert and the business transaction. It does not test or disprove this finding. No existing test covers the scenario described above. Worth writing one (business transaction rolls back → assert outbox row does NOT exist) as part of the pipeline deep-dive (tracker.md item #9), before deciding whether to open a PR.

@@ -57,6 +57,7 @@ See [six-month-plan.md](six-month-plan.md) for the full month-by-month plan (SA 
 - [flashcards.md](flashcards.md) — self-quiz cards, organized by ADR
 - [mistakes-and-corrections.md](mistakes-and-corrections.md) — every wrong/imprecise answer and its correction, with reasoning
 - [bugs-found.md](bugs-found.md) — real bugs discovered in this repo while studying, candidates for contribution
+- [questions.md](questions.md) — every question I've asked, reframed, with the full-depth answer
 
 ---
 
