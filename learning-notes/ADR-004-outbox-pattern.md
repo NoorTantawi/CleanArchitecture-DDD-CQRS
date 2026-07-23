@@ -239,13 +239,17 @@ A dead letter means: "we tried 3 times and could not deliver this — a human mu
 
 Dead letters are not failures — they are **deferred problems waiting for human judgment**.
 
+**How fast does exhaustion actually happen?** Exhaustion is governed by `RetryCount >= MaxRetries` — a count, not a timer. Inside `OutboxMessageProcessor.ProcessOutboxMessagesAsync`, the `while (processedCount < batchSize)` loop has **no delay between iterations** — the 5-second `Task.Delay` only happens between *calls* to this method (in `OutboxProcessor.ExecuteAsync`), not between individual message attempts inside it. And `GetNextUnprocessedMessageAsync` always orders `BY CreatedAt`, so the same oldest still-eligible message gets picked again immediately on the next iteration. In practice this means a message can burn through all 3 retries back-to-back, within a single invocation, in whatever time 3 failed API calls actually take — which could be milliseconds, or longer if each call hangs until an HTTP timeout. **This is NOT spread out over minutes by design — there is no delay between retry attempts at all**, only between processing cycles.
+
+**The real gap:** there is no exponential backoff. For an outage measured in hours (a government API down for a bank holiday), a fixed "3 attempts with no growing delay" policy means every affected message dead-letters within minutes of the outage starting — long before the outage itself resolves. ADR-004 lists "Exponential backoff" explicitly as a **Future** improvement, confirming this isn't built yet. A production-grade retry policy would space attempts increasingly further apart (1 min, 5 min, 30 min...) so that outages shorter than the backoff ceiling self-heal without ever needing a human to manually resend anything from the dead letter table.
+
 ---
 
-## A Real Design Note Worth Knowing
+## A Real Design Note Worth Knowing — CONFIRMED BUG
 
 `EfCoreOutboxStore.AddAsync` calls `SaveChangesAsync()` internally using a **separate `OutboxDbContext`**, distinct from the main business `DbContext` managed by `TransactionCommandPipeline`.
 
-For the outbox write to truly be atomic with the business data, both contexts must share the same database connection/transaction — this requires explicit transaction enrollment, otherwise the outbox write is technically a separate, independent commit. This is a known tradeoff flagged in this codebase. In a real fintech system, the atomicity of the outbox write is non-negotiable and worth verifying carefully, not assuming.
+For the outbox write to truly be atomic with the business data, both contexts must share the same database connection/transaction. **Confirmed by reading the actual registration and transaction code:** `EfUnitOfWork.BeginTransactionAsync` opens a transaction on the main `DbContext` only, and `OutboxDbContext` is registered independently via `AddDbContext<OutboxDbContext>` with its own connection string — no `UseTransaction(...)` call, no shared connection anywhere. This means the outbox write commits **immediately and independently**, before the main transaction even reaches its own commit. If the main transaction later rolls back, the outbox row survives anyway. Full writeup with the exact fix options: [bugs-found.md, Bug #2](bugs-found.md).
 
 ---
 
@@ -274,15 +278,13 @@ For the outbox write to truly be atomic with the business data, both contexts mu
 
 ---
 
-## Drill 4 — Still Open
+## Drill 4 — Answered (2026-07-18)
 
-Three scenarios to answer (from SA system):
+**1. Power loss at 11:00:01, restart next morning.**
+Payment record + outbox message row: both durably committed at 11:00 PM, before the crash — unaffected by the power loss. SMS and tax report: neither sent that night (`OutboxProcessor` is in-process and died with the app). On restart, `OutboxProcessor` immediately picks up the still-unprocessed row and dispatches to every registered `IIntegrationEventHandler` for that event — both SMS and tax report go out, ~8 hours late. **Nothing was lost — only delayed.** That's the entire guarantee the outbox provides.
 
-1. Payment processed at 11:00 PM, server loses power at 11:00:01, restarts next morning.
-   What is the state of: (a) the payment record, (b) the outbox message, (c) the SMS to the farmer, (d) the tax report?
+**2. No idempotency check, handler crashes before `MarkAsProcessedAsync`, retried next day.**
+Buyer receives two identical emails. Fix: idempotency check in the handler (see `InvoiceEmailHandler` example above) — check an email log before sending, record after sending.
 
-2. `InvoiceEmailHandler` has no idempotency check. Runs Monday, sends email, crashes before `MarkAsProcessedAsync`. Retried Tuesday.
-   What does the buyer receive? How do you fix the handler?
-
-3. Government tax API is down for 6 hours over a bank holiday. 80 invoices processed during that window.
-   What happens to those 80 tax reports? What table do you check in the morning, and what do you look for?
+**3. Government tax API down 6 hours, 80 invoices processed during the outage.**
+Exhaustion is governed by `RetryCount >= MaxRetries` (a count), not a timer — and there's no delay between individual retry attempts within the processing loop, only between processing cycles. All 80 messages exhaust their 3 retries within minutes of the outage starting, long before the 6-hour outage ends. By morning: **check `DeadLetterMessages`, not `OutboxMessages`** — the messages have already been moved out. Filter by `EventType` + `MovedToDeadLetterAt` falling in the outage window; check `LastError` (preserved) for the actual failure reason and `RetryCount = 3` to confirm legitimate exhaustion. **The real gap this exposes:** no exponential backoff exists yet (ADR-004 lists it as a "Future" item) — a fixed 3-attempts-no-backoff policy is inadequate for hour-scale outages; a production system would space retries increasingly further apart so shorter outages self-heal without any dead-letter/manual-resend step at all.

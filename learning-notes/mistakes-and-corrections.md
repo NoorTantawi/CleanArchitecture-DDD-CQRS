@@ -119,10 +119,22 @@ When asked "which interface," the answer is always `IDomainEventHandler` or `IIn
 
 ---
 
+## ADR-004: Outbox Pattern
+
+### Mistake 12 — Guessing a retry-exhaustion time instead of deriving it from the code
+**What I said (Drill 4, Q3):** "those 80 tax reports failed after about 15 min of retrying."
+
+**Why it's wrong:** Exhaustion in `OutboxMessageProcessor` is governed by `RetryCount >= MaxRetries` (a count, default 3) — not a timer. Worse, there's **no delay between individual retry attempts** inside the processing loop at all; the 5-second `Task.Delay` only happens *between calls* to `ProcessOutboxMessagesAsync`, not between the retries within one call. Combined with `GetNextUnprocessedMessageAsync` always picking the oldest eligible row first, a message can burn through all 3 retries back-to-back almost immediately. 15 minutes was an invented number, not derived from reading the actual retry mechanics.
+
+**Correction:** When asked "how long until X happens" in this codebase, go find the actual mechanism (count-based vs. time-based, what triggers the transition) before answering — don't estimate from vibes. The deeper lesson: all 80 messages exhaust and land in `DeadLetterMessages` within minutes of the outage starting, NOT spread across the 6-hour outage — meaning "check `OutboxMessages` in the morning" is also wrong; by then they're already in `DeadLetterMessages`, not still retrying.
+
+---
+
 ## Pattern Across All Mistakes
 
-Looking back across all 11 corrections, three recurring blind spots:
+Looking back across all 12 corrections, four recurring blind spots:
 
 1. **Mixing up "what a thing is" vs "what a thing depends on."** (Mistakes 7, 11) — a command handler isn't a domain service just because it's simple; a handler's *type* isn't the same as its *dependencies*.
 2. **Reaching for the wrong mental model under pressure.** (Mistakes 5, 6, 9) — "the event rolls back" instead of "the transaction never commits"; "stack" instead of "batch queue"; guessing a status code instead of recalling the actual one.
 3. **Same-aggregate vs cross-aggregate confusion.** (Mistakes 3, 10) — this is the single most repeated gap. Before answering any "is X protected?" question, first ask: **are we talking about ONE aggregate or TWO DIFFERENT aggregates?** Most of these mistakes disappear once that question is asked first.
+4. **Estimating timing/behavior instead of deriving it from the actual mechanism.** (Mistake 12) — "about 15 minutes" sounds reasonable but isn't grounded in anything. Before answering "how long" or "how many," find whether the system is count-based or time-based, and trace the actual loop/delay structure.
